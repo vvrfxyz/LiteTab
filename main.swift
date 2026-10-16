@@ -1323,7 +1323,7 @@ struct SettingsView: View {
                     Text("极简轻量 · 原生毫秒级窗口切换器")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
-                    Text("版本 1.2.1 (极速无阻塞版)")
+                    Text("版本 0.1")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
