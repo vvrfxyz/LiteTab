@@ -1,7 +1,7 @@
 # LiteTab 🚀
 
 <p align="center">
-  <img src="Resources/AppIcon.icns" width="128" height="128" alt="LiteTab Icon" />
+  <img src="Resources/AppIcon.png" width="128" height="128" alt="LiteTab Icon" />
 </p>
 
 <p align="center">
