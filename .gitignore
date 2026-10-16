@@ -1,0 +1,8 @@
+.DS_Store
+build/
+LiteTab
+*.app/
+*.log
+/tmp/
+.vscode/
+.idea/
