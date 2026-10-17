@@ -2,6 +2,7 @@ import Cocoa
 import Carbon
 import SwiftUI
 import ServiceManagement
+import ApplicationServices
 
 // MARK: - 日志记录
 func log(_ msg: String) {
@@ -90,6 +91,15 @@ func requestScreenCaptureAccess() {
           let sym = dlsym(handle, "CGRequestScreenCaptureAccess") else { return }
     let fn = unsafeBitCast(sym, to: CGRequestScreenCaptureAccessFunc.self)
     _ = fn()
+}
+
+var hasAccessibilityAccess: Bool {
+    return AXIsProcessTrusted()
+}
+
+func requestAccessibilityAccess() {
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    _ = AXIsProcessTrustedWithOptions(options)
 }
 
 // MARK: - 动态加载 CoreGraphics 截屏 API
@@ -196,13 +206,14 @@ class WindowItem {
 class MinimizedScanner {
     static let shared = MinimizedScanner()
     private var cachedItems: [WindowItem] = []
+    private var minimizedWIDs = Set<CGWindowID>()
     private let lock = NSLock()
     private let scanQueue = DispatchQueue(label: "com.wenruifeng.litetab.minimized_scanner", qos: .utility)
     private var timer: DispatchSourceTimer?
-    
+
     func start() {
         scan()
-        
+
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.didHideApplicationNotification, object: nil, queue: nil) { [weak self] _ in
             self?.scan()
@@ -213,7 +224,7 @@ class MinimizedScanner {
         ws.addObserver(forName: NSWorkspace.didDeactivateApplicationNotification, object: nil, queue: nil) { [weak self] _ in
             self?.scan()
         }
-        
+
         let t = DispatchSource.makeTimerSource(queue: scanQueue)
         t.schedule(deadline: .now() + 3.0, repeating: 3.0)
         t.setEventHandler { [weak self] in
@@ -222,27 +233,29 @@ class MinimizedScanner {
         t.resume()
         self.timer = t
     }
-    
+
     func scan() {
         scanQueue.async { [weak self] in
             self?.performScan()
         }
     }
-    
+
     private func performScan() {
         guard AppSettings.shared.includeMinimized else {
             lock.lock()
             cachedItems.removeAll()
+            minimizedWIDs.removeAll()
             lock.unlock()
             return
         }
-        
+
         let currentPid = ProcessInfo.processInfo.processIdentifier
         let runningApps = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && $0.processIdentifier != currentPid
         }
-        
+
         var results: [WindowItem] = []
+        var wids = Set<CGWindowID>()
         for app in runningApps {
             let pid = app.processIdentifier
             let appElement = AXUIElementCreateApplication(pid)
@@ -256,12 +269,13 @@ class MinimizedScanner {
                         var idVal: CGWindowID = 0
                         _ = _AXUIElementGetWindow(win, &idVal)
                         if idVal != 0 {
+                            wids.insert(idVal)
                             var titleVal: AnyObject?
                             _ = AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleVal)
                             let title = (titleVal as? String) ?? (app.localizedName ?? "App")
                             let appName = app.localizedName ?? "App"
                             let appIcon = app.icon ?? NSWorkspace.shared.icon(for: .application)
-                            
+
                             let item = WindowItem(
                                 wid: idVal,
                                 pid: pid,
@@ -277,16 +291,23 @@ class MinimizedScanner {
                 }
             }
         }
-        
+
         lock.lock()
         self.cachedItems = results
+        self.minimizedWIDs = wids
         lock.unlock()
     }
-    
+
     func getCached() -> [WindowItem] {
         lock.lock()
         defer { lock.unlock() }
         return cachedItems
+    }
+
+    func isMinimized(wid: CGWindowID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return minimizedWIDs.contains(wid)
     }
 }
 
@@ -294,57 +315,102 @@ class MinimizedScanner {
 class WindowManager {
     static let shared = WindowManager()
     private let captureQueue = DispatchQueue(label: "com.wenruifeng.litetab.capture", qos: .userInteractive, attributes: .concurrent)
-    
+
     // 纯纯毫秒级主线程扫描：绝不做阻塞式 AX 调用
     func getVisibleWindowsFast() -> [WindowItem] {
-        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
-            return []
-        }
-        
         var items: [WindowItem] = []
         var seenWIDs = Set<CGWindowID>()
         let currentPid = ProcessInfo.processInfo.processIdentifier
         let maxCount = AppSettings.shared.maxWindowsCount
-        
-        for w in list {
-            guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
-                  let alpha = w[kCGWindowAlpha as String] as? Double, alpha > 0.5,
-                  let bounds = w[kCGWindowBounds as String] as? [String: Any],
-                  let width = bounds["Width"] as? Double, width > 160,
-                  let height = bounds["Height"] as? Double, height > 160,
-                  let pid = w[kCGWindowOwnerPID as String] as? Int,
-                  pid != currentPid,
-                  let app = NSRunningApplication(processIdentifier: pid_t(pid)),
-                  app.activationPolicy == .regular else {
-                continue
+
+        // 1. 获取当前屏幕最顶层可见窗口（按系统窗口 Z 轴深度顺序排列）
+        let onScreenOpts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        if let onScreenList = CGWindowListCopyWindowInfo(onScreenOpts, kCGNullWindowID) as? [[String: Any]] {
+            for w in onScreenList {
+                guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
+                      let alpha = w[kCGWindowAlpha as String] as? Double, alpha > 0.5,
+                      let bounds = w[kCGWindowBounds as String] as? [String: Any],
+                      let width = bounds["Width"] as? Double, width > 160,
+                      let height = bounds["Height"] as? Double, height > 160,
+                      let pid = w[kCGWindowOwnerPID as String] as? Int,
+                      pid != currentPid,
+                      let app = NSRunningApplication(processIdentifier: pid_t(pid)),
+                      app.activationPolicy == .regular else {
+                    continue
+                }
+
+                let wid = CGWindowID(w[kCGWindowNumber as String] as? Int ?? 0)
+                if seenWIDs.contains(wid) { continue }
+                seenWIDs.insert(wid)
+
+                let appName = app.localizedName ?? (w[kCGWindowOwnerName as String] as? String) ?? "App"
+                let appIcon = app.icon ?? NSWorkspace.shared.icon(for: .application)
+                let rawTitle = w[kCGWindowName as String] as? String ?? ""
+                let displayTitle = rawTitle.isEmpty ? appName : rawTitle
+
+                let cachedImg = ThumbnailCache.shared.get(wid: wid)
+                let isMin = MinimizedScanner.shared.isMinimized(wid: wid)
+
+                let item = WindowItem(
+                    wid: wid,
+                    pid: pid_t(pid),
+                    appName: appName,
+                    appIcon: appIcon,
+                    title: displayTitle,
+                    isMinimized: isMin,
+                    thumbnail: cachedImg
+                )
+                items.append(item)
+                if items.count >= maxCount { return items }
             }
-            
-            let wid = CGWindowID(w[kCGWindowNumber as String] as? Int ?? 0)
-            if seenWIDs.contains(wid) { continue }
-            seenWIDs.insert(wid)
-            
-            let appName = app.localizedName ?? (w[kCGWindowOwnerName as String] as? String) ?? "App"
-            let appIcon = app.icon ?? NSWorkspace.shared.icon(for: .application)
-            let rawTitle = w[kCGWindowName as String] as? String ?? ""
-            let displayTitle = rawTitle.isEmpty ? appName : rawTitle
-            
-            let cachedImg = ThumbnailCache.shared.get(wid: wid)
-            
-            let item = WindowItem(
-                wid: wid,
-                pid: pid_t(pid),
-                appName: appName,
-                appIcon: appIcon,
-                title: displayTitle,
-                isMinimized: false,
-                thumbnail: cachedImg
-            )
-            items.append(item)
-            if items.count >= maxCount { break }
         }
-        
-        // 瞬间合并后台预缓存的最小化窗口 (耗时 0 毫秒)
+
+        // 2. 获取跨 Space (虚拟桌面)、全屏、后台未上屏及真实多窗口 (例如 Chrome 另一个窗口)
+        let allOpts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+        if let allList = CGWindowListCopyWindowInfo(allOpts, kCGNullWindowID) as? [[String: Any]] {
+            for w in allList {
+                guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
+                      let alpha = w[kCGWindowAlpha as String] as? Double, alpha > 0.5,
+                      let bounds = w[kCGWindowBounds as String] as? [String: Any],
+                      let width = bounds["Width"] as? Double, width > 160,
+                      let height = bounds["Height"] as? Double, height > 160,
+                      let pid = w[kCGWindowOwnerPID as String] as? Int,
+                      pid != currentPid,
+                      let app = NSRunningApplication(processIdentifier: pid_t(pid)),
+                      app.activationPolicy == .regular else {
+                    continue
+                }
+
+                let wid = CGWindowID(w[kCGWindowNumber as String] as? Int ?? 0)
+                if seenWIDs.contains(wid) { continue }
+
+                // 核心防幽灵过滤：非当前可见屏幕的后台窗口，必须具有非空真实标题
+                // 这样能精准过滤掉各大 App 的无标题隐形面板、系统背景服务，同时保留真实的网页/文档/多窗口
+                let rawTitle = w[kCGWindowName as String] as? String ?? ""
+                guard !rawTitle.isEmpty else { continue }
+
+                seenWIDs.insert(wid)
+
+                let appName = app.localizedName ?? (w[kCGWindowOwnerName as String] as? String) ?? "App"
+                let appIcon = app.icon ?? NSWorkspace.shared.icon(for: .application)
+                let cachedImg = ThumbnailCache.shared.get(wid: wid)
+                let isMin = MinimizedScanner.shared.isMinimized(wid: wid)
+
+                let item = WindowItem(
+                    wid: wid,
+                    pid: pid_t(pid),
+                    appName: appName,
+                    appIcon: appIcon,
+                    title: rawTitle,
+                    isMinimized: isMin,
+                    thumbnail: cachedImg
+                )
+                items.append(item)
+                if items.count >= maxCount { return items }
+            }
+        }
+
+        // 3. 瞬间合并后台预缓存的最小化窗口 (补充无标题但被最小化的窗口)
         if AppSettings.shared.includeMinimized && items.count < maxCount {
             let minItems = MinimizedScanner.shared.getCached()
             for minItem in minItems {
@@ -355,23 +421,23 @@ class WindowManager {
                 }
             }
         }
-        
+
         return items
     }
-    
+
     // 后台抓取缩略图并即时释放内存
-    func loadThumbnailsAsync(items: [WindowItem], onImageLoaded: @escaping (Int, NSImage, String) -> Void) {
+    func loadThumbnailsAsync(items: [WindowItem], onImageLoaded: @escaping (Int, NSImage, String, Bool) -> Void) {
         for (idx, item) in items.enumerated() {
             captureQueue.async { [weak self] in
                 guard let self = self else { return }
-                
+
                 if item.isMinimized {
                     DispatchQueue.main.async {
-                        onImageLoaded(idx, item.appIcon, item.title)
+                        onImageLoaded(idx, item.appIcon, item.title, true)
                     }
                     return
                 }
-                
+
                 autoreleasepool {
                     var loadedImg: NSImage? = nil
                     if let createFn = cgCreateImage,
@@ -386,52 +452,60 @@ class WindowManager {
                             ThumbnailCache.shared.set(wid: item.wid, image: finalNSImg)
                         }
                     }
-                    
+
                     let currentImg = loadedImg ?? item.thumbnail ?? item.appIcon
                     item.thumbnail = currentImg
-                    
+
                     DispatchQueue.main.async {
-                        onImageLoaded(idx, currentImg, item.title)
+                        onImageLoaded(idx, currentImg, item.title, item.isMinimized)
                     }
-                    
-                    let realTitle = self.getAXWindowTitle(pid: item.pid, wid: item.wid)
+
+                    let (realTitle, isActuallyMin) = self.getAXWindowDetails(pid: item.pid, wid: item.wid)
+                    if isActuallyMin {
+                        item.isMinimized = true
+                    }
                     if !realTitle.isEmpty {
-                        let updatedTitle = (item.isMinimized ? "[最小化] " : "") + realTitle
-                        item.title = updatedTitle
+                        item.title = realTitle
                         DispatchQueue.main.async {
-                            onImageLoaded(idx, currentImg, updatedTitle)
+                            onImageLoaded(idx, currentImg, realTitle, item.isMinimized)
                         }
                     }
                 }
             }
         }
     }
-    
-    private func getAXWindowTitle(pid: pid_t, wid: CGWindowID) -> String {
+
+    private func getAXWindowDetails(pid: pid_t, wid: CGWindowID) -> (title: String, isMinimized: Bool) {
         let appElement = AXUIElementCreateApplication(pid)
         var windowsValue: AnyObject?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
               let axWindows = windowsValue as? [AXUIElement] else {
-            return ""
+            return ("", false)
         }
         for win in axWindows {
             var idVal: CGWindowID = 0
             if _AXUIElementGetWindow(win, &idVal) == .success && idVal == wid {
                 var titleVal: AnyObject?
-                if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleVal) == .success,
-                   let t = titleVal as? String {
-                    return t
+                _ = AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleVal)
+                let title = (titleVal as? String) ?? ""
+
+                var minVal: AnyObject?
+                var isMin = false
+                if AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minVal) == .success,
+                   let m = minVal as? Bool {
+                    isMin = m
                 }
+                return (title, isMin)
             }
         }
-        return ""
+        return ("", false)
     }
-    
+
     func activateWindow(pid: pid_t, wid: CGWindowID, isMinimized: Bool = false) {
         guard let app = NSRunningApplication(processIdentifier: pid) else { return }
         if app.isHidden { app.unhide() }
         app.activate()
-        
+
         let appElement = AXUIElementCreateApplication(pid)
         var windowsValue: AnyObject?
         if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
@@ -439,7 +513,9 @@ class WindowManager {
             for win in axWindows {
                 var idVal: CGWindowID = 0
                 if _AXUIElementGetWindow(win, &idVal) == .success && idVal == wid {
-                    if isMinimized {
+                    var minVal: AnyObject?
+                    let isActuallyMin = (AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minVal) == .success && (minVal as? Bool == true))
+                    if isMinimized || isActuallyMin {
                         AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
                     }
                     AXUIElementPerformAction(win, kAXRaiseAction as CFString)
@@ -449,7 +525,7 @@ class WindowManager {
             }
         }
     }
-    
+
     func closeWindow(pid: pid_t, wid: CGWindowID) {
         ThumbnailCache.shared.remove(wid: wid)
         let appElement = AXUIElementCreateApplication(pid)
@@ -613,11 +689,25 @@ class WindowCardView: NSView {
         titleLabel.stringValue = "\(item.appName) - \(item.title)"
         self.isSelected = selected
     }
-    
+
     func updateImage(_ image: NSImage, title: String) {
         placeholderIconView.isHidden = true
         imageView.image = image
         titleLabel.stringValue = title
+    }
+
+    func updateDetails(image: NSImage, title: String, isMinimized: Bool) {
+        placeholderIconView.isHidden = true
+        imageView.image = image
+        titleLabel.stringValue = title
+        if isMinimized {
+            badgeLabel.stringValue = "最小化"
+            badgeLabel.isHidden = false
+            alphaValue = 0.8
+        } else {
+            badgeLabel.isHidden = true
+            alphaValue = 1.0
+        }
     }
     
     private func updateSelectionState() {
@@ -716,9 +806,9 @@ class LiteTabPanel: NSPanel {
         startKeyMonitor()
         startReleaseCheck()
         
-        WindowManager.shared.loadThumbnailsAsync(items: windows) { [weak self] (idx, img, title) in
+        WindowManager.shared.loadThumbnailsAsync(items: windows) { [weak self] (idx, img, title, isMin) in
             guard let self = self, idx < self.cards.count else { return }
-            self.cards[idx].updateImage(img, title: "\(self.windows[idx].appName) - \(title)")
+            self.cards[idx].updateDetails(image: img, title: "\(self.windows[idx].appName) - \(title)", isMinimized: isMin)
         }
     }
     
@@ -1107,6 +1197,7 @@ struct SettingsView: View {
     @State private var launchAtLogin: Bool = false
     @State private var memoryMB: Double = getProcessMemoryMB()
     @State private var screenCaptureOK: Bool = hasScreenCaptureAccess
+    @State private var accessibilityOK: Bool = hasAccessibilityAccess
     @State private var selectedTab: Int = 0
     
     let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
@@ -1323,7 +1414,7 @@ struct SettingsView: View {
                     Text("极简轻量 · 原生毫秒级窗口切换器")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
-                    Text("版本 0.1")
+                    Text("版本 0.2")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1347,13 +1438,39 @@ struct SettingsView: View {
                             .cornerRadius(6)
                     } else {
                         Button("去授权 ⚠️") {
-                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                            requestScreenCaptureAccess()
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                                NSWorkspace.shared.open(url)
+                            }
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                     }
                 }
-                
+
+                HStack {
+                    Label("辅助功能权限 (识别多窗口/最小化)", systemImage: "hand.raised")
+                    Spacer()
+                    if accessibilityOK {
+                        Text("已正常授权 ✅")
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.green.opacity(0.15))
+                            .foregroundColor(.green)
+                            .cornerRadius(6)
+                    } else {
+                        Button("去授权 ⚠️") {
+                            requestAccessibilityAccess()
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+
                 HStack {
                     Label("真实物理内存 (Footprint)", systemImage: "memorychip")
                     Spacer()
@@ -1362,7 +1479,7 @@ struct SettingsView: View {
                         .bold()
                         .foregroundColor(.green)
                 }
-                
+
                 HStack {
                     Label("待机 CPU 消耗", systemImage: "cpu")
                     Spacer()
@@ -1408,6 +1525,7 @@ struct SettingsView: View {
     private func refreshHealth() {
         memoryMB = getProcessMemoryMB()
         screenCaptureOK = hasScreenCaptureAccess
+        accessibilityOK = hasAccessibilityAccess
     }
 }
 
@@ -1454,7 +1572,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !hasCap {
             requestScreenCaptureAccess()
         }
-        
+
+        let hasAX = hasAccessibilityAccess
+        log("当前辅助功能权限: \(hasAX)")
+        if !hasAX {
+            requestAccessibilityAccess()
+        }
+
         _ = CarbonHotkeyManager.shared.registerHotkey()
         MinimizedScanner.shared.start()
         setupStatusMenu()
